@@ -3,6 +3,10 @@
 #include <vector>
 #include <algorithm>
 #include <fstream>
+#include <math.h>
+
+#define INITIAL_SORT_ITEM_COUNT 1000000
+#define NUM_WAYS_MERGE 128
 
 #define TIME_SIZE 9
 #define SYMBOL_SIZE 16
@@ -10,39 +14,6 @@
 #define PRICE_SIZE 11
 #define BID_SIZE_SIZE 7
 #define ASK_SIZE_SIZE 7
-
-
-struct RawTrade
-{
-    char tm[TIME_SIZE];
-    char venue;
-    char symbol[SYMBOL_SIZE];
-    char cond[4];
-    char qty[QUANTITY_SIZE];
-    char prc[PRICE_SIZE];
-    char filler0;
-    char corr[2];
-    char filler1[18];
-    char rchar;
-    char nchar;
-};
-
-struct RawNBBO
-{
-    char tm[TIME_SIZE];
-    char venue;
-    char symbol[SYMBOL_SIZE];
-    char filler0[65];
-    char bid[PRICE_SIZE]; // bid price
-    char bsize[BID_SIZE_SIZE]; // bid size
-    char filler1[8];
-    char ask[PRICE_SIZE]; // ask price
-    char asize[ASK_SIZE_SIZE]; // ask size
-    char filler2[7];
-    char filler3[2]; // since 2013/02/05
-    char rchar;
-    char nchar;
-};
 
 struct Trade
 {
@@ -62,9 +33,14 @@ struct NBBO
     char tm[TIME_SIZE];
 };
 
-void appendTrade(std::vector<Trade> & trades, std::string line)
+struct LineIndexEntry
 {
-    Trade trade;
+    std::string line;
+    int index;
+};
+
+void fillTrade(Trade & trade, std::string line)
+{
     int start = 0;
     int end = start + TIME_SIZE;
     for (int i = start; i < end; ++i)
@@ -89,13 +65,10 @@ void appendTrade(std::vector<Trade> & trades, std::string line)
     {
         trade.prc[(i - start)] = line[i];
     }
-
-    trades.push_back(trade);
 }
 
-void appendNBBO(std::vector<NBBO> & nbbos, std::string line)
+void fillNBBO(NBBO & nbbo, std::string line)
 {
-    NBBO nbbo;
     int start = 0;
     int end = start + TIME_SIZE;
     for (int i = start; i < end; ++i)
@@ -132,8 +105,6 @@ void appendNBBO(std::vector<NBBO> & nbbos, std::string line)
     {
         nbbo.asize[(i - start)] = line[i];
     }
-
-    nbbos.push_back(nbbo);
 }
 
 template <typename A, typename B>
@@ -150,9 +121,17 @@ bool compareByTime(const A & t1, const B & t2)
 	return false;
 }
 
-void sortTrades(std::vector<Trade> & trades)
+bool compareByTimeStr(const std::string & t1, const std::string & t2)
 {
-    std::sort(trades.begin(), trades.end(), compareByTime<Trade, Trade>);
+	for (int i = 0; i < TIME_SIZE; ++i)
+	{
+		if (t1[i] != t2[i])
+		{
+			return (t1[i] < t2[i]);
+		}
+	}
+
+	return false;
 }
 
 void sortNBBOs(std::vector<NBBO> & nbbos)
@@ -220,44 +199,19 @@ void fillNBBOLine(char * nbboLine, const NBBO & nbbo)
     }
 }
 
-void writeToOutput(std::vector<Trade> & trades, std::vector<NBBO> & nbbos)
+void writeToTmpOutput(const std::string filename, const std::vector<Trade> & trades)
 {
-    std::ofstream outfile("output.txt");
+    std::ofstream outfile(filename.c_str());
+    std::cout << filename;
     char tradeLine[47];
-    char nbboLine[63];
     tradeLine[45] = '\n';
     tradeLine[46] = '\0';
-    nbboLine[61] = '\n';
-    nbboLine[62] = '\0';
     if (outfile.is_open())
     {
-        int start1 = 0, start2 = 0;
-        while (start1 < trades.size() && start2 < nbbos.size())
+        for (int i = 0; i < trades.size(); ++i)
         {
-            if (compareByTime<Trade, NBBO>(trades[start1], nbbos[start2]))
-            {
-                fillTradeLine(tradeLine, trades[start1]);
-                outfile << tradeLine;
-                start1++;
-            }
-            else
-            {
-                fillNBBOLine(nbboLine, nbbos[start2]);
-                outfile << nbboLine;
-                start2++;
-            }
-        }
-        while (start1 < trades.size())
-        {
-            fillTradeLine(tradeLine, trades[start1]);
+            fillTradeLine(tradeLine, trades[i]);
             outfile << tradeLine;
-            start1++;
-        }
-        while (start2 < nbbos.size())
-        {
-            fillNBBOLine(nbboLine, nbbos[start2]);
-            outfile << nbboLine;
-            start2++;
         }
         outfile.close();
     }
@@ -267,20 +221,91 @@ void writeToOutput(std::vector<Trade> & trades, std::vector<NBBO> & nbbos)
     }
 }
 
-int main(int argc, char const *argv[])
+std::string mergeSortedFiles(int fileCount, int numRun)
 {
-    std::vector<Trade> trades;
-    std::vector<NBBO> nbbos;
+    char filenameBuf[128];  // to allow a huge fileCount and numRun
+    int numRun = 0;
+    std::vector<std::ifstream> inputFiles;
+    LineIndexEntry inputEntries[NUM_WAYS_MERGE];
+    std::string line;
+    while (fileCount > 1)
+    {
+        int num = 0, mergeFileCount = 0;
+        for (int i = 0; i < fileCount; ++i)
+        {
+            sprintf(filenameBuf, "tmp-trade-%d-%d.txt", numRun, i);
+            std::ifstream currFile(filenameBuf);
+            inputFiles.push_back(currFile);
+            num++;
+            if (num >= NUM_WAYS_MERGE)
+            {
+                // merge all files
+                // so the basic idea here is to have vector of strings
+                // and also vector of indexes(sorted--better min heap). write that line to out and try to get
+                // a new line from that file. if it fails, then that file is done. remove that index
+                // when only one file exists, this still works
+                for (int j = 0; j < NUM_WAYS_MERGE; ++j)
+                {
+                    getline(inputFiles[i], line);
+                    inputEntries[i].line = line;
+                    inputEntries[i].index = i;
+                }
+                sprintf(filenameBuf, "tmp-trade-%d-%d.txt", numRun + 1, mergeFileCount);
+                std::ofstream outfile(filenameBuf);
+                // sort it
+                // for smallest in inputEntries, output line to outfile
+                // and refill it and sort it. if inputEntries empty, done
+                for (int j = 0; j < inputFiles.size(); ++j)
+                {
+                    inputFiles[j].close();
+                }
+                inputFiles.erase(inputFiles.begin(), inputFiles.end());
+                mergeFileCount++;
+                num = 0;
+            }
+        }
+        if (num > 0)
+        {
+            //merge the remaining
+        }
+        numRun++;
+        fileCount = (int)ceil(fileCount * 1.0 / NUM_WAYS_MERGE;
+    }
+    sprintf(filenameBuf, "tmp-trade-%d-%d.txt", numRun, fileCount);
+    return std::string(filenameBuf);
+}
 
+void processTradeFile()
+{
+    std::vector<Trade> trades(INITIAL_SORT_ITEM_COUNT);
     std::string line;
     std::string tradeFileName("sample_trades.txt");
     std::ifstream infile1(tradeFileName.c_str());
+    char filenameBuf[128];  // to allow a huge fileCount and numRun
+    int numRun = 0, numCount = 0, fileCount = 0, itemLimit = INITIAL_SORT_ITEM_COUNT - 1;
     if (infile1.is_open())
     {
         getline(infile1, line);  // skip first line: not a trade record
         while (getline(infile1, line))
         {
-            appendTrade(trades, line);
+            fillTrade(trades[numCount], line);
+            numCount++;
+            if (numCount >= itemLimit)
+            {
+                std::sort(trades.begin(), trades.end(), compareByTime<Trade, Trade>);
+                sprintf(filenameBuf, "tmp-trade-%d-%d.txt", numRun, fileCount);
+                std::string filename(filenameBuf);
+                writeToTmpOutput(filename, trades);
+                numCount = 0;
+                fileCount++;
+            }
+        }
+        if (numCount > 0)
+        {
+            std::sort(trades.begin(), trades.end(), compareByTime<Trade, Trade>);
+            sprintf(filenameBuf, "tmp-trade-%d-%d.txt", numRun, fileCount);
+            std::string filename(filenameBuf);
+            writeToTmpOutput(filename, trades);
         }
         infile1.close();
     }
@@ -288,27 +313,27 @@ int main(int argc, char const *argv[])
     {
         std::cout << "File" << tradeFileName << " cannot be opened!\n";
     }
+}
 
-    std::string nbboFileName("sample_nbbos.txt");
-    std::ifstream infile2(nbboFileName.c_str());
-    if (infile2.is_open())
-    {
-        getline(infile2, line);  // skip first line: not a nbbo record
-        while (getline(infile2, line))
-        {
-            appendNBBO(nbbos, line);
-        }
-        infile2.close();
-    }
-    else
-    {
-        std::cout << "File" << nbboFileName << " cannot be opened!\n";
-    }
+int main(int argc, char const *argv[])
+{
+    processTradeFile();
 
-    sortTrades(trades);
-    sortNBBOs(nbbos);
-
-    writeToOutput(trades, nbbos);
+//    std::string nbboFileName("sample_nbbos.txt");
+//    std::ifstream infile2(nbboFileName.c_str());
+//    if (infile2.is_open())
+//    {
+//        getline(infile2, line);  // skip first line: not a nbbo record
+//        while (getline(infile2, line))
+//        {
+//            appendNBBO(nbbos, line);
+//        }
+//        infile2.close();
+//    }
+//    else
+//    {
+//        std::cout << "File" << nbboFileName << " cannot be opened!\n";
+//    }
 
     return 0;
 }
